@@ -1,5 +1,5 @@
-// client/src/components/VideoPlayer.tsx
-import React, { useState, useRef, useEffect } from 'react';
+// client/src/components/VideoPlayer.tsx - Updated to better save progress
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import ReactPlayer from 'react-player';
 import { useVideoProgress } from '../hooks/useVideoProgress';
 import { Video } from '../types';
@@ -19,7 +19,14 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ video }) => {
     const [seeking, setSeeking] = useState<boolean>(false);
     const [buffering, setBuffering] = useState<boolean>(false);
     const [videoReady, setVideoReady] = useState<boolean>(false);
-    const [localProgress, setLocalProgress] = useState<number>(0); // Local progress for immediate feedback
+    const [localProgress, setLocalProgress] = useState<number>(0);
+    const [initialSeekDone, setInitialSeekDone] = useState<boolean>(false);
+
+    // Tracking continuous playing sessions
+    const playSessionStartRef = useRef<number | null>(null);
+    const progressIntervalRef = useRef<NodeJS.Timeout | null>(null);
+    const saveTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+    const hasUnsavedProgress = useRef<boolean>(false);
 
     const {
         progress,
@@ -50,77 +57,128 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ video }) => {
 
     // Update local progress for immediate feedback
     useEffect(() => {
-        if (duration > 0 && !seeking && !buffering && videoReady && playing) {
+        if (duration > 0 && !seeking && !buffering && videoReady) {
             // Update local progress for immediate visual feedback
             const percentage = Math.min((currentTime / duration) * 100, 100);
             setLocalProgress(Math.round(percentage));
         }
-    }, [currentTime, duration, seeking, buffering, videoReady, playing]);
+    }, [currentTime, duration, seeking, buffering, videoReady]);
 
     // Initialize with server progress when it loads
     useEffect(() => {
         if (progress && !isLoading) {
+            console.log(`Initializing with server progress: ${progress.progress_percentage}%`);
             setLocalProgress(Math.round(progress.progress_percentage));
         }
     }, [progress, isLoading]);
 
-    // Update current time periodically while playing
-    useEffect(() => {
-        let interval: NodeJS.Timeout | null = null;
-
-        if (playing && !seeking && !buffering && videoReady) {
-            interval = setInterval(() => {
-                const currentPlayerTime = playerRef.current?.getCurrentTime() || 0;
-                setCurrentTime(currentPlayerTime);
-                trackProgress(currentPlayerTime);
-            }, 250); // More frequent updates (4 times per second)
-        }
-
-        return () => {
-            if (interval) clearInterval(interval);
-        };
-    }, [playing, seeking, buffering, videoReady, trackProgress]);
-
     // Set initial position based on progress after video is ready
     useEffect(() => {
-        if (progress && playerRef.current && !isLoading && videoReady) {
+        if (progress && playerRef.current && !isLoading && videoReady && !initialSeekDone) {
             console.log(`Setting initial position to ${progress.last_position}`);
 
             // Small delay to ensure the player is fully ready
             const timer = setTimeout(() => {
+                console.log("Seeking to initial position now");
                 playerRef.current?.seekTo(progress.last_position, 'seconds');
                 setCurrentTime(progress.last_position);
+                setInitialSeekDone(true);
             }, 500);
 
             return () => clearTimeout(timer);
         }
-    }, [progress, isLoading, videoReady]);
+    }, [progress, isLoading, videoReady, initialSeekDone]);
+
+    // Set up periodic progress tracking when playing
+    useEffect(() => {
+        if (playing && !seeking && !buffering && videoReady) {
+            console.log("Starting progress tracking interval");
+
+            // Clear any existing interval
+            if (progressIntervalRef.current) {
+                clearInterval(progressIntervalRef.current);
+            }
+
+            // Set up new interval
+            progressIntervalRef.current = setInterval(() => {
+                const currentPlayerTime = playerRef.current?.getCurrentTime() || 0;
+                setCurrentTime(currentPlayerTime);
+                trackProgress(currentPlayerTime);
+                hasUnsavedProgress.current = true;
+            }, 250); // 4 times per second
+        } else if (progressIntervalRef.current) {
+            console.log("Stopping progress tracking interval");
+            clearInterval(progressIntervalRef.current);
+            progressIntervalRef.current = null;
+        }
+
+        // Clean up on unmount
+        return () => {
+            if (progressIntervalRef.current) {
+                clearInterval(progressIntervalRef.current);
+                progressIntervalRef.current = null;
+            }
+        };
+    }, [playing, seeking, buffering, videoReady, trackProgress]);
+
+    // Periodic save to server (separate from tracking)
+    useEffect(() => {
+        // Set up save interval when playing or when we have unsaved progress
+        if ((playing && videoReady && !seeking && !buffering) || hasUnsavedProgress.current) {
+            // Clear existing timeout if any
+            if (saveTimeoutRef.current) {
+                clearTimeout(saveTimeoutRef.current);
+            }
+
+            // Set new timeout
+            saveTimeoutRef.current = setTimeout(() => {
+                if (hasUnsavedProgress.current) {
+                    console.log("Saving progress to server...");
+                    saveProgress();
+                    hasUnsavedProgress.current = false;
+                }
+            }, 2000); // Save every 2 seconds when playing
+        }
+
+        // Clean up on unmount
+        return () => {
+            if (saveTimeoutRef.current) {
+                clearTimeout(saveTimeoutRef.current);
+                saveTimeoutRef.current = null;
+            }
+        };
+    }, [playing, videoReady, seeking, buffering, currentTime, saveProgress]);
 
     // Save progress when component unmounts
     useEffect(() => {
         return () => {
             console.log("Component unmounting, final progress save");
-            if (playing) {
-                stopTracking(currentTime);
-            }
-            saveProgress();
-        };
-    }, [playing, currentTime, stopTracking, saveProgress]);
-
-    // Force progress save every 2 seconds while playing
-    useEffect(() => {
-        let saveInterval: NodeJS.Timeout | null = null;
-
-        if (playing && videoReady && !seeking && !buffering) {
-            saveInterval = setInterval(() => {
+            if (hasUnsavedProgress.current) {
                 saveProgress();
-            }, 2000);
-        }
-
-        return () => {
-            if (saveInterval) clearInterval(saveInterval);
+            }
         };
-    }, [playing, videoReady, seeking, buffering, saveProgress]);
+    }, [saveProgress]);
+
+    // Track play sessions more accurately
+    const startPlaySession = useCallback((time: number) => {
+        console.log(`Starting play session at ${time.toFixed(2)}`);
+        playSessionStartRef.current = time;
+        startTracking(time);
+        hasUnsavedProgress.current = true;
+    }, [startTracking]);
+
+    const endPlaySession = useCallback((time: number) => {
+        if (playSessionStartRef.current !== null) {
+            console.log(`Ending play session at ${time.toFixed(2)}`);
+            stopTracking(time);
+            playSessionStartRef.current = null;
+
+            // Force immediate save on session end
+            console.log("Forcing immediate save on session end");
+            saveProgress();
+            hasUnsavedProgress.current = false;
+        }
+    }, [stopTracking, saveProgress]);
 
     // Handle player events
     const handleReady = () => {
@@ -138,24 +196,23 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ video }) => {
     };
 
     const handlePlay = () => {
-        console.log('Video playing');
+        console.log('Video playing at', currentTime);
         setPlaying(true);
-        startTracking(currentTime);
+        startPlaySession(currentTime);
     };
 
     const handlePause = () => {
-        console.log('Video paused');
+        console.log('Video paused at', currentTime);
         setPlaying(false);
-        stopTracking(currentTime);
-        // Save progress immediately on pause
-        saveProgress();
+        endPlaySession(currentTime);
     };
 
     const handleBuffer = () => {
         console.log('Video buffering');
         setBuffering(true);
         if (playing) {
-            stopTracking(currentTime);
+            // Temporarily pause tracking during buffer
+            endPlaySession(currentTime);
         }
     };
 
@@ -163,7 +220,8 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ video }) => {
         console.log('Video buffering ended');
         setBuffering(false);
         if (playing) {
-            startTracking(currentTime);
+            // Resume tracking after buffer
+            startPlaySession(currentTime);
         }
     };
 
@@ -182,7 +240,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ video }) => {
         console.log('Seek started');
         setSeeking(true);
         if (playing) {
-            stopTracking(currentTime);
+            endPlaySession(currentTime);
         }
     };
 
@@ -199,11 +257,17 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ video }) => {
         setSeeking(false);
 
         if (playing) {
-            startTracking(newTime);
+            startPlaySession(newTime);
+        } else {
+            // Even if not playing, we should track the seek position
+            trackProgress(newTime);
+            hasUnsavedProgress.current = true;
+            saveProgress();
         }
     };
 
     const handleReset = async () => {
+        console.log("Resetting progress");
         await resetProgress();
         if (playerRef.current) {
             playerRef.current.seekTo(0, 'seconds');
@@ -215,10 +279,17 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ video }) => {
     const handleEnded = () => {
         console.log('Video ended');
         setPlaying(false);
-        stopTracking(duration);
-        saveProgress();
+        endPlaySession(duration);
+
         // Force progress to 100% when video ends
         setLocalProgress(100);
+
+        // Explicitly set current time to duration to ensure 100% progress
+        setCurrentTime(duration);
+
+        // Force immediate save with 100% progress
+        console.log("Video ended - forcing save with 100% progress");
+        saveProgress();
     };
 
     if (!auth.isAuthenticated) {
@@ -226,7 +297,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ video }) => {
     }
 
     return (
-        <div className="w-full bg-black rounded-lg overflow-hidden shadow-lg">
+        <div className="w-full bg-black rounded-lg overflow-hidden shadow-lg video-player-container">
             <div className="relative aspect-video">
                 <ReactPlayer
                     ref={playerRef}
@@ -271,7 +342,13 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ video }) => {
                 <div className="flex justify-between items-center">
                     <div className="text-white">
                         {isLoading ? (
-                            <span>Loading progress...</span>
+                            <span className="flex items-center">
+                                <svg className="animate-spin -ml-1 mr-2 h-4 w-4 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                                </svg>
+                                Loading progress...
+                            </span>
                         ) : (
                             <div className="flex items-center">
                                 <span className="mr-2">Progress:</span>
@@ -286,12 +363,41 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ video }) => {
                         )}
                     </div>
 
-                    <button
-                        onClick={handleReset}
-                        className="bg-red-600 hover:bg-red-700 text-white px-3 py-1 rounded-md text-sm transition-colors duration-200"
-                    >
-                        Reset Progress
-                    </button>
+                    <div className="flex space-x-2">
+                        {progress && progress.last_position > 0 && (
+                            <button
+                                onClick={() => {
+                                    playerRef.current?.seekTo(0, 'seconds');
+                                    setCurrentTime(0);
+
+                                    // Also track the seek to start
+                                    if (playing) {
+                                        endPlaySession(currentTime);
+                                        startPlaySession(0);
+                                    } else {
+                                        trackProgress(0);
+                                        hasUnsavedProgress.current = true;
+                                        saveProgress();
+                                    }
+                                }}
+                                className="bg-gray-600 hover:bg-gray-700 text-white px-3 py-1 rounded-md text-sm transition-colors duration-200 flex items-center"
+                            >
+                                <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 11l7-7m0 0l7 7m-7-7v18" />
+                                </svg>
+                                Start Over
+                            </button>
+                        )}
+                        <button
+                            onClick={handleReset}
+                            className="bg-red-600 hover:bg-red-700 text-white px-3 py-1 rounded-md text-sm transition-colors duration-200 flex items-center"
+                        >
+                            <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                            </svg>
+                            Reset Progress
+                        </button>
+                    </div>
                 </div>
 
                 {error && (
